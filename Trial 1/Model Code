@@ -1,0 +1,1218 @@
+# Bottlenose Dolphin Whistle Classifier
+### Raven Pro Selection Tables + SEANOE Public Dataset
+
+#**Pipeline:**
+#1. Load Raven `.txt` selection tables → parse whistle timestamps from your recordings
+#2. Load SEANOE public dataset → pre-cut whistle clips (positives) + noise segments (negatives)
+#3. Combine both sources into one training set
+#4. Oversample whistle frames to fix class imbalance
+#5. Train binary CNN (whistle vs noise)
+#6. Run inference on your recordings → frame-level probability CSV
+#7. Detect whistle events via state flips → chop WAV into clips
+
+#**Expected folder structure:**
+#```
+#project/
+#├── wavs/                          ← your own recordings
+#│   ├── 25-12-01_OBJ_KDK_EM_ynw_bne.wav
+#│   ├── 25-12-01_OBJ_KNG_EM_ynw_bne.wav
+#│   └── OBJ_25-09-01_ANN_EM_yse-bsw.wav
+#├── labels/                        ← Raven selection tables
+#│   ├── 25-12-01_OBJ_KDK_EM_ynw_bne.Table.1.selections.txt
+#│   ├── 25-12-01_OBJ_KNG_EM_ynw_bne.Table.1.selections.txt
+#│   └── OBJ_25-09-01_ANN_EM_yse-bsw.Table.1.selections.txt
+#├── seanoe/                        ← SEANOE public dataset (see Cell 3 for download link)
+#│   ├── Whistle_Signals/
+#│   │   └── 20211120_102109_192/
+#│   │       ├── 20211120_102109_192-W-52.07.wav
+#│   │       └── ...
+#│   ├── Vocalization_Labels/
+#│   │   ├── 20211120_102109_192.txt
+#│   │   └── ...
+#│   └── 122802/                    ← numbered raw recording folders
+#│       └── Raw_recordings_Day1_pt1/
+#│           └── 20211120_102109_192.wav
+#└── whistles_out/                  ← created automatically
+#```
+
+#**Annotation filtering:**  
+#Selections annotated as `chaos`, `SUB?`, or `SUB` are excluded by default.  
+#Edit `EXCLUDE_ANNOTATIONS` in Cell 3 to customize.
+
+#**SEANOE label types used:**
+#- `W` and `W+NOISE` → whistle (positive)
+#- `NOISE` → noise (negative)
+#- All other labels (`ECT`, `BPS`, `FB`, etc.) → ignored
+
+############################################################
+
+## Cell 1 — Install dependencies
+#Run once. Restart kernel after if needed.
+# Run this cell once, then restart the kernel if prompted
+
+# Install all required Python libraries if they aren't already present.
+# librosa: audio loading and spectrogram generation
+# soundfile: saving audio clips to disk
+# scikit-learn: train/test splitting and classification metrics
+# torch/torchvision: the neural network framework
+# pandas/numpy: data manipulation and numerical arrays
+
+import subprocess, sys
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+                'librosa', 'soundfile', 'scikit-learn', 'torch', 'torchvision', 'pandas', 'numpy'])
+
+############################################################
+
+## Cell 2 — Imports
+import os        # file and folder path operations
+import re        # regular expressions for parsing filenames
+import glob      # recursive file searching
+import warnings
+warnings.filterwarnings('ignore')  # suppress noisy library warnings
+
+import numpy as np          # numerical array operations
+import pandas as pd         # reading CSVs and dataframes
+import librosa              # audio loading and mel-spectrogram extraction
+import soundfile as sf      # writing output WAV clip files
+import matplotlib.pyplot as plt  # plotting training curves and timelines
+
+from sklearn.model_selection import train_test_split   # split data into train/val sets
+from sklearn.metrics import classification_report      # precision/recall/F1 report
+
+import torch                        # core PyTorch tensor library
+import torch.nn as nn               # neural network layers (Conv2d, Linear, etc.)
+import torch.optim as optim         # optimizers (Adam) and learning rate schedulers
+from torch.utils.data import Dataset, DataLoader  # batching and data pipeline
+
+print(f'PyTorch version : {torch.__version__}')
+print(f'librosa version : {librosa.__version__}')
+# Use GPU if available, otherwise fall back to CPU
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'Device          : {device}')
+
+############################################################
+
+## Cell 3 — ⚙️ Configuration  ← Edit paths and settings here
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+WAV_DIR    = r'C:\Users\rjjne\OneDrive\Desktop\Dolphin-Project\wavs'
+RAVEN_DIR  = r'C:\Users\rjjne\OneDrive\Desktop\Dolphin-Project\labels'
+OUTPUT_DIR = r'C:\Users\rjjne\OneDrive\Desktop\Dolphin-Project\whistles_out'
+
+# ── SEANOE dataset path ────────────────────────────────────────────────────
+
+# Public dolphin dataset used to supplement your own recordings.
+# Download from: https://www.seanoe.org/data/00495/60631/
+# Set USE_SEANOE = False to skip it and train on your recordings only.
+
+SEANOE_DIR  = r'C:\Users\rjjne\OneDrive\Desktop\Dolphin-Project\seanoe'
+USE_SEANOE  = True
+MAX_SEANOE_NOISE_PER_FILE = 50  # cap noise patches per file to prevent imbalance
+
+# ── Audio settings ─────────────────────────────────────────────────────────
+SR           = 22050  # all audio is resampled to this rate (Hz) for consistency
+N_MELS       = 64     # number of mel frequency bins in each spectrogram
+HOP_LENGTH   = 256    # number of audio samples between each spectrogram column
+WIN_DURATION = 0.5    # length of the audio window fed into the CNN (seconds)
+FRAME_HOP    = 0.1    # how far to step forward between frames during inference (seconds)
+                      # smaller = finer time resolution but slower
+
+# ── Detection thresholds ───────────────────────────────────────────────────
+THRESHOLD    = 0.5    # CNN output above this = whistle, below = noise
+MIN_GAP      = 0.2    # merge two detections if the gap between them is smaller than this (seconds)
+MIN_DURATION = 0.2    # throw away detections shorter than this (seconds)
+PADDING      = 0.05   # add this much silence before/after each saved clip (seconds)
+
+# ── Training settings ──────────────────────────────────────────────────────
+EPOCHS           = 30     # number of full passes through the training data
+BATCH_SIZE       = 64     # number of spectrogram patches processed per gradient update
+LEARN_RATE       = 1e-3   # initial learning rate for the Adam optimizer
+OVERSAMPLE_RATIO = 5.0    # after oversampling, noise frames will be at most 5x whistle frames
+MODEL_SAVE_PATH  = r'C:\Users\rjjne\OneDrive\Desktop\Dolphin-Project\whistle_model.pt'
+
+# ── SEANOE label categories ────────────────────────────────────────────────
+SEANOE_WHISTLE_LABELS = {'W', 'W+NOISE'}  # these label types count as whistle (positive)
+SEANOE_NOISE_LABELS   = {'NOISE'}          # these label types count as noise (negative)
+# All other SEANOE labels (ECT, BPS, FB, etc.) are ignored entirely
+
+# ── Annotation filtering for your Raven tables ─────────────────────────────
+
+# Any selection with one of these annotations will be excluded from training.
+# Add or remove values here as needed.
+
+EXCLUDE_ANNOTATIONS = {'chaos', 'SUB?', 'SUB'}
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)  # create output folder if it doesn't exist yet
+print('Config loaded.')
+print(f'  SEANOE integration : {"ENABLED" if USE_SEANOE else "DISABLED"}')
+print(f'  Output dir ready   : {OUTPUT_DIR}')
+
+############################################################
+
+
+## Cell 4 — Feature extraction (shared by both data sources)
+def extract_patch(y, sr, center_sec, duration=WIN_DURATION):
+    """
+    Convert a short window of raw audio into a mel-spectrogram image.
+    This is the core feature the CNN learns from — not the raw waveform.
+
+    Steps:
+      1. Slice a chunk of audio centred on center_sec
+      2. Zero-pad if the chunk is too short (e.g. near the start/end of the file)
+      3. Compute mel-spectrogram: frequency vs time, weighted by human hearing
+      4. Convert power to decibels (log scale matches how we perceive loudness)
+      5. Normalise to [0, 1] so all patches have the same contrast range
+    """
+    start_sec    = center_sec - duration / 2
+    start_sample = max(0, int(start_sec * sr))
+    chunk        = y[start_sample : start_sample + int(duration * sr)]
+    target_len   = int(duration * sr)
+
+    if len(chunk) < target_len:
+        chunk = np.pad(chunk, (0, target_len - len(chunk)))  # zero-pad short chunks
+
+    S    = librosa.feature.melspectrogram(
+               y=chunk, sr=sr, n_mels=N_MELS,
+               hop_length=HOP_LENGTH, fmax=sr // 2)
+    S_db = librosa.power_to_db(S, ref=np.max)
+    # Normalise to [0,1] range
+    S_db = (S_db - S_db.min()) / (S_db.max() - S_db.min() + 1e-8)
+    return S_db.astype(np.float32)
+
+
+def extract_patch_from_clip(y, sr, duration=WIN_DURATION):
+    """
+    Simpler version for SEANOE pre-cut clips that are already short.
+    Since the whole clip is a whistle, we just centre the window on the middle.
+    """
+    center = len(y) / sr / 2
+    return extract_patch(y, sr, center, duration)
+
+
+print('Feature extraction functions defined.')
+
+############################################################
+
+## Cell 5 — Load your Raven selection tables
+
+def parse_filename_metadata(txt_filename):
+    """
+    Pull the recording date, task code, and dolphin ID out of a Raven
+    selection table filename. The filename encodes this metadata, e.g.:
+      25-12-01_OBJ_KDK_EM_ynw_bne.Table.1.selections.txt
+        → date=2025-12-01, task=OBJ, dolphin=KDK
+    Handles both field orderings found in your files.
+    """
+    stem     = os.path.splitext(txt_filename)[0]
+    # Remove the Raven-appended suffix (.Table.1.selections)
+    stem     = re.sub(r'\.Table\.\d+\.selections$', '', stem)
+    parts    = stem.split('_')
+    # Date fields look like YY-MM-DD
+    date_pat = re.compile(r'^\d{2}-\d{2}-\d{2}$')
+
+    date_str, task, dolphin = None, None, None
+    for i, p in enumerate(parts):
+        if date_pat.match(p):
+            yy, mm, dd = p.split('-')
+            date_str = f'20{yy}-{mm}-{dd}'
+            task     = parts[i - 1] if i > 0 else None        # field before date = task
+            dolphin  = parts[i + 1] if i + 1 < len(parts) else None  # field after = dolphin
+            break
+    return date_str, task, dolphin
+
+
+def load_raven_labels(raven_dir, wav_dir, exclude_annotations=None):
+    """
+    Read every Raven .txt selection table in raven_dir and match each one
+    to its corresponding WAV file by searching recursively through wav_dir.
+
+    For each matched pair, returns a dict:
+      { wav_path -> DataFrame with 'start' and 'end' columns (seconds) }
+    """
+    if exclude_annotations is None:
+        exclude_annotations = set()
+
+    # Find all .txt files in the labels folder
+    txt_files = sorted([f for f in os.listdir(raven_dir) if f.lower().endswith('.txt')])
+
+    if not txt_files:
+        raise FileNotFoundError(f'No .txt files found in: {raven_dir}')
+
+    wav_labels = {}
+
+    for txt_fname in txt_files:
+        txt_path = os.path.join(raven_dir, txt_fname)
+
+        # Read the tab-separated Raven table
+        try:
+            df = pd.read_csv(txt_path, sep='\t')
+        except Exception as e:
+            print(f'  WARNING: Could not read {txt_fname}: {e}')
+            continue
+
+        df.columns = df.columns.str.strip()  # remove any accidental whitespace in headers
+
+        # Skip files that don't have the time columns we need
+        if not {'Begin Time (s)', 'End Time (s)'}.issubset(df.columns):
+            print(f'  WARNING: {txt_fname} missing time columns — skipping.')
+            print(f'           Found: {list(df.columns)}')
+            continue
+
+        # Remove any selections flagged with excluded annotations
+        n_before = len(df)
+        if exclude_annotations and 'Annotation' in df.columns:
+            df['Annotation'] = df['Annotation'].fillna('').str.strip()
+            excluded = df[df['Annotation'].isin(exclude_annotations)]
+            if len(excluded):
+                print(f'  Excluding {len(excluded)} row(s) from {txt_fname}: '
+                      f'{excluded["Annotation"].tolist()}')
+            df = df[~df['Annotation'].isin(exclude_annotations)]
+
+        # Keep only start and end times, clean up the dataframe
+        labels_df = (df[['Begin Time (s)', 'End Time (s)']]
+                     .copy()
+                     .rename(columns={'Begin Time (s)': 'start', 'End Time (s)': 'end'})
+                     .dropna()
+                     .astype(float)
+                     .sort_values('start')
+                     .reset_index(drop=True))
+
+        # Derive the expected WAV filename from the label filename stem
+        stem     = re.sub(r'\.Table\.\d+\.selections$', '', os.path.splitext(txt_fname)[0])
+        wav_name = stem + '.wav'
+
+        # Search all subfolders of wav_dir to find the matching WAV file
+        wav_path = None
+        for root, dirs, files in os.walk(wav_dir):
+            if wav_name in files:
+                wav_path = os.path.join(root, wav_name)
+                break  # stop as soon as we find it
+
+        if wav_path is None:
+            print(f'  WARNING: WAV not found anywhere under {wav_dir} for {txt_fname}')
+            print(f'           Looking for: {wav_name}')
+            continue
+
+        date_str, task, dolphin = parse_filename_metadata(txt_fname)
+        print(f'  ✓ {txt_fname}')
+        print(f'    Date={date_str}  Task={task}  Dolphin={dolphin}')
+        print(f'    Labels: {n_before} total → {len(labels_df)} kept after annotation filter')
+
+        wav_labels[wav_path] = labels_df
+
+    if not wav_labels:
+        raise RuntimeError(
+            'No WAV files could be matched to selection tables. '
+            'Check that WAV filenames match your .txt filenames (same stem).'
+        )
+    return wav_labels
+
+
+# ── Run it ──
+print('Loading Raven selection tables...\n')
+wav_labels = load_raven_labels(
+    raven_dir=RAVEN_DIR,
+    wav_dir=WAV_DIR,
+    exclude_annotations=EXCLUDE_ANNOTATIONS
+)
+print(f'\nMatched {len(wav_labels)} WAV file(s).')
+
+############################################################
+
+## Cell 6 — Label preview
+
+#Sanity check on what was loaded from your Raven tables.
+#Confirms timestamps are reasonable and the right number of selections were kept.
+
+for wav_path, ldf in wav_labels.items():
+    durations = ldf['end'] - ldf['start']
+    print(f'WAV : {os.path.basename(wav_path)}')
+    print(f'  Selections     : {len(ldf)}')
+    print(f'  Duration range : {durations.min():.3f}s – {durations.max():.3f}s  (mean {durations.mean():.3f}s)')
+    print(f'  Time range     : {ldf["start"].min():.1f}s – {ldf["end"].max():.1f}s')
+    display(ldf.head(5))
+    print()
+
+############################################################
+
+#Cell 7 — Build dataset from your recordings
+
+def frame_is_whistle(t_center, labels_df):
+    """
+    Decide if a frame centred at t_center overlaps any labeled whistle.
+    Uses direct interval overlap — if the frame window touches a whistle
+    window at all, the frame is labelled as whistle (1), otherwise noise (0).
+    This is simpler and more accurate than the original IoU approach because
+    we have real end times from Raven rather than assumed durations.
+    """
+    t_start = t_center - FRAME_HOP / 2
+    t_end   = t_center + FRAME_HOP / 2
+    for _, row in labels_df.iterrows():
+        if t_start < row.end and t_end > row.start:  # any overlap = whistle
+            return True
+    return False
+
+
+def build_own_dataset(wav_labels):
+    """
+    Slide a frame window across every WAV file at FRAME_HOP intervals.
+    For each frame, extract a mel-spectrogram patch and assign a label:
+      1 = whistle (frame overlaps a Raven-labeled whistle interval)
+      0 = noise   (frame doesn't overlap any labeled interval)
+
+    Returns all patches, all labels, and a cache of loaded audio
+    (wav_audio) so we don't have to reload files during inference.
+    """
+    patches, targets = [], []
+    wav_audio = {}  # cache: {wav_path -> (y, sr)}
+
+    for wav_path, labels_df in wav_labels.items():
+        fname = os.path.basename(wav_path)
+        print(f'  Loading: {fname}')
+        # Load audio, resampling to SR and converting to mono
+        y, sr = librosa.load(wav_path, sr=SR, mono=True)
+        print(f'    Duration : {len(y)/sr:.1f}s  ({len(y)/sr/60:.1f} min)')
+        wav_audio[wav_path] = (y, sr)  # cache for later inference
+
+        total_dur = len(y) / sr
+        t = FRAME_HOP / 2  # start half a frame in so the first window is centred correctly
+        file_patches, file_targets = [], []
+
+        while t < total_dur:
+            file_patches.append(extract_patch(y, sr, t))
+            file_targets.append(1 if frame_is_whistle(t, labels_df) else 0)
+            t += FRAME_HOP
+
+        n_pos = sum(file_targets)
+        n_neg = len(file_targets) - n_pos
+        print(f'    Frames : {len(file_targets)} total  |  whistle={n_pos}  noise={n_neg}')
+
+        patches.extend(file_patches)
+        targets.extend(file_targets)
+
+    return patches, targets, wav_audio
+
+
+print('Building dataset from your recordings...\n')
+own_patches, own_targets, wav_audio = build_own_dataset(wav_labels)
+
+n_own_pos = sum(own_targets)
+n_own_neg = len(own_targets) - n_own_pos
+print(f'\nYour recordings — {len(own_targets)} frames total')
+print(f'  Whistle : {n_own_pos}')
+print(f'  Noise   : {n_own_neg}')
+
+############################################################
+
+#Cell 8 — Load SEANOE dataset
+
+def load_seanoe_label_file(txt_path):
+    """
+    Parse a SEANOE Vocalization_Labels text file.
+    Each line has three fields: start_sec  end_sec  label
+    Returns a DataFrame with those three columns.
+    """
+    rows = []
+    with open(txt_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                rows.append({'start': float(parts[0]),
+                             'end'  : float(parts[1]),
+                             'label': parts[2].upper()})
+            except ValueError:
+                continue
+    return pd.DataFrame(rows)
+
+
+def build_seanoe_dataset(seanoe_dir,
+                         whistle_labels=SEANOE_WHISTLE_LABELS,
+                         noise_labels=SEANOE_NOISE_LABELS,
+                         max_noise_per_file=MAX_SEANOE_NOISE_PER_FILE):
+    """
+    Build training patches from the SEANOE public dolphin dataset.
+
+    Positives (whistle=1):
+      Pre-cut whistle clips in Whistle_Signals/ subfolders.
+      Each clip is already trimmed to just the whistle, so we centre
+      a single window on the whole clip.
+
+    Negatives (noise=0):
+      NOISE-labeled segments from Vocalization_Labels/ text files,
+      extracted from the corresponding raw recordings in numbered subfolders.
+      We slide non-overlapping windows across each NOISE segment.
+      max_noise_per_file caps how many we take per recording to prevent
+      SEANOE noise from overwhelming your own data.
+    """
+    patches, targets = [], []
+
+    whistle_signals_dir     = os.path.join(seanoe_dir, 'Whistle_Signals')
+    vocalization_labels_dir = os.path.join(seanoe_dir, 'Vocalization_Labels')
+
+    # ── Positives: load every pre-cut whistle clip ─────────────────────────
+    whistle_wavs = glob.glob(
+        os.path.join(whistle_signals_dir, '**', '*.wav'), recursive=True)
+    print(f'  SEANOE whistle clips found : {len(whistle_wavs)}')
+
+    whistle_ok = 0
+    for wav_path in whistle_wavs:
+        try:
+            y, sr = librosa.load(wav_path, sr=SR, mono=True)
+            if len(y) < int(WIN_DURATION * sr / 2):
+                continue  # skip clips too short for a full window
+            patches.append(extract_patch_from_clip(y, sr))
+            targets.append(1)
+            whistle_ok += 1
+        except Exception:
+            continue
+    print(f'  SEANOE whistle patches loaded : {whistle_ok}')
+
+    # ── Negatives: index all raw WAV files across numbered subfolders ───────
+    raw_wav_index = {}  # stem -> full path
+    for entry in os.scandir(seanoe_dir):
+        if not entry.is_dir():
+            continue
+        for wav_path in glob.glob(
+                os.path.join(entry.path, '**', '*.wav'), recursive=True):
+            stem = os.path.splitext(os.path.basename(wav_path))[0]
+            raw_wav_index[stem] = wav_path
+
+    txt_files = glob.glob(os.path.join(vocalization_labels_dir, '*.txt'))
+    print(f'  SEANOE label files found      : {len(txt_files)}')
+
+    noise_patches_added = 0
+    for txt_path in txt_files:
+        # Match label file to its raw WAV by filename stem
+        stem     = os.path.splitext(os.path.basename(txt_path))[0]
+        wav_path = raw_wav_index.get(stem)
+        if wav_path is None:
+            continue
+
+        label_df = load_seanoe_label_file(txt_path)
+        if label_df.empty or 'label' not in label_df.columns:
+            continue
+
+        # Only use rows labelled as pure NOISE
+        noise_rows = label_df[label_df['label'].isin(noise_labels)]
+        if noise_rows.empty:
+            continue
+
+        try:
+            y, sr = librosa.load(wav_path, sr=SR, mono=True)
+        except Exception:
+            continue
+
+        total_dur = len(y) / sr
+        count = 0
+        for _, row in noise_rows.iterrows():
+            if count >= max_noise_per_file:
+                break
+            # Slide non-overlapping windows across each NOISE segment
+            t = row.start + WIN_DURATION / 2
+            while t < min(row.end, total_dur) - WIN_DURATION / 2:
+                patches.append(extract_patch(y, sr, t))
+                targets.append(0)
+                t += WIN_DURATION
+                count += 1
+            noise_patches_added += 1
+
+    print(f'  SEANOE noise patches loaded   : {noise_patches_added}')
+    return patches, targets
+
+
+# ── Run it ──
+if USE_SEANOE:
+    if not os.path.isdir(SEANOE_DIR):
+        raise FileNotFoundError(
+            f'SEANOE directory not found: {SEANOE_DIR}\n'
+            f'Download from https://www.seanoe.org/data/00495/60631/ '
+            f'or set USE_SEANOE = False in Cell 3 to skip.'
+        )
+    print('Loading SEANOE dataset...\n')
+    seanoe_patches, seanoe_targets = build_seanoe_dataset(SEANOE_DIR)
+    n_seanoe_pos = sum(seanoe_targets)
+    n_seanoe_neg = len(seanoe_targets) - n_seanoe_pos
+    print(f'\nSEANOE — {len(seanoe_targets)} patches total')
+    print(f'  Whistle : {n_seanoe_pos}')
+    print(f'  Noise   : {n_seanoe_neg}')
+else:
+    seanoe_patches, seanoe_targets = [], []
+    print('SEANOE disabled — training on your recordings only.')
+
+############################################################
+
+## Cell 9 — Combine datasets and review totals
+
+# Merge your recordings and SEANOE into one combined training set.
+# The model will learn from both sources simultaneously — it has no concept of where each patch came from.
+all_patches = own_patches + seanoe_patches
+all_targets = own_targets + seanoe_targets
+
+all_targets_arr = np.array(all_targets)
+n_pos_total = int(all_targets_arr.sum())
+n_neg_total = int(len(all_targets_arr) - n_pos_total)
+
+print('═' * 50)
+print('  COMBINED TRAINING SET')
+print('═' * 50)
+print(f'  Your recordings  : {len(own_targets):>6} frames  '
+      f'(whistle={sum(own_targets)}, noise={len(own_targets)-sum(own_targets)})')
+if USE_SEANOE:
+    print(f'  SEANOE dataset   : {len(seanoe_targets):>6} frames  '
+          f'(whistle={sum(seanoe_targets)}, noise={len(seanoe_targets)-sum(seanoe_targets)})')
+print('─' * 50)
+print(f'  Total            : {len(all_targets):>6} frames')
+print(f'  Whistle          : {n_pos_total:>6}')
+print(f'  Noise            : {n_neg_total:>6}')
+print(f'  Ratio            : 1:{n_neg_total // max(n_pos_total, 1)}')
+print('═' * 50)
+
+if n_pos_total == 0:
+    raise RuntimeError(
+        'No whistle frames found. '
+        'Check WAV file paths and that timestamps fall within the audio duration.'
+    )
+
+############################################################
+
+## Cell 10 — Visualise sample patches
+
+#Whistle patches (top row) should look visually distinct from noise (bottom row).
+
+# Plot 4 random whistle patches and 4 random noise patches side by side.
+# Whistle patches should show a visible arc or ridge of energy in the mid-to-high frequency range. 
+#Noise patches should look more uniform or random. 
+#If they look the same, the labels may be misaligned.
+
+patches_arr = np.array(all_patches)
+targets_arr = all_targets_arr
+
+whistle_idx = np.where(targets_arr == 1)[0]
+noise_idx   = np.where(targets_arr == 0)[0]
+
+rng      = np.random.default_rng(0)
+w_sample = rng.choice(whistle_idx, size=min(4, len(whistle_idx)), replace=False)
+n_sample = rng.choice(noise_idx,   size=min(4, len(noise_idx)),   replace=False)
+
+fig, axes = plt.subplots(2, 4, figsize=(14, 5))
+for i, idx in enumerate(w_sample):
+    axes[0, i].imshow(patches_arr[idx], aspect='auto', origin='lower', cmap='magma')
+    axes[0, i].set_title('WHISTLE', color='steelblue', fontweight='bold')
+    axes[0, i].axis('off')
+for i, idx in enumerate(n_sample):
+    axes[1, i].imshow(patches_arr[idx], aspect='auto', origin='lower', cmap='magma')
+    axes[1, i].set_title('NOISE', color='coral', fontweight='bold')
+    axes[1, i].axis('off')
+
+plt.suptitle('Sample mel-spectrogram patches (top: whistle, bottom: noise)', fontsize=13)
+plt.tight_layout()
+plt.show()
+
+############################################################
+
+## Cell 11 — Oversample minority class
+
+def oversample_minority(patches, targets, target_ratio=OVERSAMPLE_RATIO):
+    """
+    Whistle frames are naturally rare — maybe 1 in 50 frames in a long recording.
+    If we trained on this imbalanced data directly, the model would learn to
+    just predict 'noise' for everything and still get 98% accuracy.
+
+    Fix: duplicate whistle frames (with tiny random noise added so they're not
+    exact copies) until the noise:whistle ratio is no worse than target_ratio.
+    The noise jitter also acts as light data augmentation.
+    """
+    patches = np.array(patches)
+    targets = np.array(targets)
+    pos_idx = np.where(targets == 1)[0]  # indices of whistle frames
+    n_pos   = len(pos_idx)
+    n_neg   = int((targets == 0).sum())
+
+    if n_pos == 0:
+        return patches, targets  # nothing to oversample
+
+    # How many whistle frames do we need to reach the target ratio?
+    desired_pos = max(n_pos, int(n_neg / target_ratio))
+    rng = np.random.default_rng(42)  # fixed seed for reproducibility
+
+    if desired_pos > n_pos:
+        # Randomly pick existing whistle frames to duplicate
+        extra_idx     = rng.choice(pos_idx, size=desired_pos - n_pos, replace=True)
+        extra_patches = patches[extra_idx].copy()
+        # Add tiny Gaussian noise as light augmentation
+        extra_patches += rng.normal(0, 0.01, extra_patches.shape).astype(np.float32)
+        extra_patches  = np.clip(extra_patches, 0, 1)  # keep values in valid range
+        patches = np.concatenate([patches, extra_patches], axis=0)
+        targets = np.concatenate([targets, np.ones(len(extra_idx))], axis=0)
+
+    # Shuffle so whistle and noise frames are mixed throughout each batch
+    shuffle = rng.permutation(len(targets))
+    return patches[shuffle], targets[shuffle]
+
+
+print('Oversample function defined.')
+
+############################################################
+
+## Cell 12 — CNN model definition
+
+class WhistleCNN(nn.Module):
+    """
+    A 3-layer convolutional neural network that classifies mel-spectrogram
+    patches as either whistle (1) or noise (0).
+
+    Architecture:
+      Feature extractor — 3 conv blocks, each with:
+        Conv2d:      scans the spectrogram image with small 3x3 filters
+                     to detect local patterns (edges, ridges, arcs)
+        BatchNorm:   normalises activations for faster, more stable training
+        ReLU:        non-linearity — lets the network learn complex patterns
+        MaxPool/AvgPool: shrinks the spatial dimensions, keeping the strongest signal
+
+      Classifier — two fully connected layers that take the extracted features
+        and output a single logit (raw score before sigmoid)
+        Dropout(0.4): randomly zeroes 40% of neurons during training to
+                      prevent overfitting on the small whistle dataset
+
+    Input:  (batch_size, H, W)  — a batch of 2D spectrogram patches
+    Output: (batch_size,)       — one raw logit per patch
+                                  apply sigmoid to get probability in [0,1]
+    """
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            # Block 1: 1 input channel → 16 feature maps
+            nn.Conv2d(1, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(2),
+            # Block 2: 16 → 32 feature maps
+            nn.Conv2d(16, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            # Block 3: 32 → 64 feature maps, then compress to fixed 4x4 spatial size
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),                        # flatten 64x4x4 = 1024 values into a vector
+            nn.Linear(64 * 4 * 4, 128), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(128, 1),                   # single output logit
+        )
+
+    def forward(self, x):
+        # x arrives as (batch, H, W) — add channel dim to get (batch, 1, H, W)
+        return self.classifier(self.features(x.unsqueeze(1))).squeeze(1)
+
+
+class SpectrogramDataset(Dataset):
+    """
+    Wraps numpy arrays of patches and targets into a PyTorch Dataset
+    so DataLoader can batch and shuffle them automatically.
+    """
+    def __init__(self, patches, targets):
+        self.X = torch.tensor(np.array(patches), dtype=torch.float32)
+        self.y = torch.tensor(np.array(targets), dtype=torch.float32)
+    def __len__(self):
+        return len(self.y)
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
+
+
+total_params = sum(p.numel() for p in WhistleCNN().parameters() if p.requires_grad)
+print(f'WhistleCNN — {total_params:,} trainable parameters')
+print(WhistleCNN())
+
+############################################################
+
+## Cell 13 — Train the model
+
+def train_model(patches, targets, epochs=EPOCHS, device=device):
+    """
+    Full training loop:
+      1. Oversample whistle frames to fix class imbalance
+      2. Split into 85% train / 15% validation
+      3. For each epoch:
+           - Forward pass: feed patches through CNN, get logits
+           - Compute BCE loss: how wrong were the predictions?
+           - Backward pass: compute gradients
+           - Update weights: Adam optimizer step
+           - Validate on held-out set
+           - Reduce learning rate if val loss plateaus (ReduceLROnPlateau)
+           - Save best model weights seen so far
+      4. Restore best weights and print final classification report
+    """
+    patches = np.array(patches)
+    targets = np.array(targets)
+
+    n_pos = int(targets.sum())
+    n_neg = int(len(targets) - n_pos)
+    print(f'Before oversampling: whistle={n_pos}, noise={n_neg}  (ratio 1:{n_neg // max(n_pos,1)})')
+
+    patches, targets = oversample_minority(patches, targets)
+
+    n_pos2 = int(targets.sum())
+    n_neg2 = int(len(targets) - n_pos2)
+    print(f'After  oversampling: whistle={n_pos2}, noise={n_neg2}  (ratio 1:{n_neg2 // max(n_pos2,1)})')
+
+    # Stratified split keeps the same whistle:noise ratio in both sets
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        patches, targets, test_size=0.15, stratify=targets, random_state=42)
+
+    train_dl = DataLoader(SpectrogramDataset(X_tr,  y_tr),  batch_size=BATCH_SIZE, shuffle=True)
+    val_dl   = DataLoader(SpectrogramDataset(X_val, y_val), batch_size=BATCH_SIZE)
+
+    # BCEWithLogitsLoss = binary cross-entropy, numerically stable version
+    # (combines sigmoid + BCE in one operation)
+    criterion = nn.BCEWithLogitsLoss()
+    model     = WhistleCNN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARN_RATE)
+    # Halve the learning rate if validation loss doesn't improve for 4 epochs
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4, factor=0.5)
+
+    best_val_loss = float('inf')
+    best_state    = None
+    history       = {'train': [], 'val': []}
+
+    print(f'\nTraining for {epochs} epochs on {device}...\n')
+
+    for epoch in range(1, epochs + 1):
+        # ── Training pass ──
+        model.train()  # enable dropout and batchnorm training behaviour
+        train_loss = 0.0
+        for xb, yb in train_dl:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()          # clear gradients from previous step
+            loss = criterion(model(xb), yb)  # forward pass + loss
+            loss.backward()                # backprop: compute gradients
+            optimizer.step()               # update weights
+            train_loss += loss.item() * len(yb)
+        train_loss /= len(train_dl.dataset)
+
+        # ── Validation pass ──
+        model.eval()   # disable dropout, use running stats for batchnorm
+        val_loss = 0.0
+        with torch.no_grad():  # no gradients needed during validation
+            for xb, yb in val_dl:
+                val_loss += criterion(model(xb.to(device)), yb.to(device)).item() * len(yb)
+        val_loss /= len(val_dl.dataset)
+
+        scheduler.step(val_loss)  # possibly reduce learning rate
+        history['train'].append(train_loss)
+        history['val'].append(val_loss)
+
+        # Save the best model weights seen so far
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state    = {k: v.clone() for k, v in model.state_dict().items()}
+            marker        = ' ← best'
+        else:
+            marker = ''
+
+        print(f'Epoch {epoch:3d}/{epochs}  train={train_loss:.4f}  val={val_loss:.4f}{marker}')
+
+    # Restore the best weights before returning
+    model.load_state_dict(best_state)
+
+    # Final report on the validation set using the best model
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for xb, yb in val_dl:
+            logits = model(xb.to(device))
+            # Apply sigmoid to convert logit → probability, then threshold
+            preds.extend((torch.sigmoid(logits) > THRESHOLD).cpu().numpy().astype(int))
+            trues.extend(yb.numpy().astype(int))
+
+    print('\n── Validation Classification Report ──')
+    print(classification_report(trues, preds,
+                                 target_names=['noise', 'whistle'],
+                                 zero_division=0))
+    return model, history
+
+
+# ── Run training ──
+model, history = train_model(all_patches, all_targets)
+
+if MODEL_SAVE_PATH:
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    print(f'\nModel saved → {MODEL_SAVE_PATH}')
+
+############################################################
+
+## Cell 14 — Training loss curve
+
+# Plot training and validation loss over epochs.
+# Healthy training: both curves decrease and then level off.
+# Overfitting: training loss keeps dropping but validation loss rises.
+# If you see overfitting, try increasing Dropout or reducing EPOCHS in Cell 3.
+
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.plot(history['train'], label='Train loss', color='steelblue')
+ax.plot(history['val'],   label='Val loss',   color='coral')
+ax.set_xlabel('Epoch')
+ax.set_ylabel('BCE Loss')
+ax.set_title('Training curve')
+ax.legend()
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+############################################################
+
+## Cell 15 — Inference: score every frame in each WAV
+
+def predict_frames(model, y, sr, device=device):
+    """
+    Run the trained model across an entire WAV file, one frame at a time.
+    Steps every FRAME_HOP seconds, extracts a spectrogram patch,
+    and returns an array of whistle probabilities — one per frame.
+    Patches are batched in groups of 128 for efficiency.
+    """
+    total_duration = len(y) / sr
+    frame_times, patches = [], []
+    t = FRAME_HOP / 2
+    while t < total_duration:
+        patches.append(extract_patch(y, sr, t))
+        frame_times.append(round(t, 3))
+        t += FRAME_HOP
+
+    probs = []
+    model.eval()
+    with torch.no_grad():  # inference only — no gradient tracking needed
+        for i in range(0, len(patches), 128):
+            batch = torch.tensor(
+                np.array(patches[i : i + 128]), dtype=torch.float32
+            ).to(device)
+            # sigmoid converts raw logit → probability in [0, 1]
+            probs.extend(torch.sigmoid(model(batch)).cpu().numpy())
+
+    return np.array(frame_times), np.array(probs)
+
+
+print('predict_frames defined.')
+
+############################################################
+
+#Cell 16 — Segment detection and clip extraction
+
+def to_mmss(s):
+    """Convert seconds to M:SS.ss timestamp string for readability."""
+    m = int(s) // 60
+    return f'{m}:{s - m * 60:05.2f}'
+
+
+def save_frame_csv(frame_times, probs, threshold, output_dir, wav_stem):
+    """
+    Save a CSV of frame-level predictions for the full recording.
+    Columns: time_sec, timestamp, probability, whistle (0 or 1)
+    Useful for inspecting exactly where the model is confident vs uncertain.
+    """
+    df = pd.DataFrame({
+        'time_sec'   : frame_times,
+        'timestamp'  : [to_mmss(t) for t in frame_times],
+        'probability': np.round(probs, 4),
+        'whistle'    : (probs >= threshold).astype(int),
+    })
+    csv_path = os.path.join(output_dir, f'{wav_stem}_predictions.csv')
+    df.to_csv(csv_path, index=False)
+    print(f'  Frame CSV → {os.path.basename(csv_path)}')
+    return df
+
+
+def frames_to_segments(frame_times, probs,
+                        threshold=THRESHOLD,
+                        min_gap=MIN_GAP,
+                        min_duration=MIN_DURATION):
+    """
+    Convert per-frame probabilities into (start, end) whistle event timestamps.
+
+    Steps:
+      1. Threshold: any frame with prob >= threshold is marked as whistle
+      2. State machine: track transitions from noise→whistle (start) and
+         whistle→noise (end) to build raw segment boundaries
+      3. Merge: if two segments are separated by less than min_gap seconds,
+         join them into one (handles brief probability dips mid-whistle)
+      4. Filter: discard any segment shorter than min_duration seconds
+         (removes spurious single-frame detections)
+    """
+    labels     = probs >= threshold
+    segments   = []
+    in_whistle = False
+    seg_start  = None
+
+    for t, is_on in zip(frame_times, labels):
+        if is_on and not in_whistle:       # noise → whistle transition
+            seg_start  = t - FRAME_HOP / 2
+            in_whistle = True
+        elif not is_on and in_whistle:     # whistle → noise transition
+            segments.append([seg_start, t - FRAME_HOP / 2])
+            in_whistle = False
+
+    if in_whistle:  # whistle runs all the way to end of file
+        segments.append([seg_start, frame_times[-1] + FRAME_HOP / 2])
+
+    if not segments:
+        return []
+
+    # Merge segments that are close together
+    merged = [segments[0]]
+    for start, end in segments[1:]:
+        if start - merged[-1][1] <= min_gap:
+            merged[-1][1] = max(merged[-1][1], end)  # extend current segment
+        else:
+            merged.append([start, end])               # start a new segment
+
+    # Drop segments that are too short to be real whistles
+    return [(s, e) for s, e in merged if (e - s) >= min_duration]
+
+
+def save_whistle_clips(y, sr, segments, output_dir, wav_stem, padding=PADDING):
+    """
+    For each detected whistle segment, slice that portion of audio
+    and save it as an individual WAV file with a small padding buffer.
+    Files are named with the whistle index and exact timestamps.
+    """
+    total_dur = len(y) / sr
+    saved = []
+    for i, (start, end) in enumerate(segments):
+        s     = max(0.0, start - padding)   # add padding but don't go before 0
+        e     = min(total_dur, end + padding)  # add padding but don't exceed file length
+        chunk = y[int(s * sr) : int(e * sr)]
+        fname = os.path.join(
+            output_dir,
+            f'{wav_stem}__whistle_{i+1:04d}_{s:.3f}-{e:.3f}s.wav'
+        )
+        sf.write(fname, chunk, sr)
+        saved.append(fname)
+        print(f'    [{i+1:04d}]  {s:.2f}s – {e:.2f}s  ({e-s:.2f}s)')
+    return saved
+
+
+print('Inference and segment functions defined.')
+
+############################################################
+
+#Cell 17 — Run inference + save everything
+
+# Master inference loop — runs the trained model on every WAV file
+# and saves all outputs: frame CSVs, whistle clips, and a combined detections CSV.
+
+all_saved     = []   # list of all saved clip file paths
+all_det_rows  = []   # rows for the combined detections CSV
+all_frame_dfs = {}   # frame-level prediction dataframes keyed by WAV stem
+
+for wav_path, (y, sr) in wav_audio.items():
+    wav_stem = os.path.splitext(os.path.basename(wav_path))[0]
+    print(f'\n── {wav_stem} ──')
+
+    # Step 1: score every frame in the recording
+    frame_times, probs = predict_frames(model, y, sr)
+
+    # Step 2: save frame-level probabilities to CSV for inspection
+    frame_df = save_frame_csv(frame_times, probs, THRESHOLD, OUTPUT_DIR, wav_stem)
+    all_frame_dfs[wav_stem] = frame_df
+
+    # Step 3: convert frame probabilities into whistle event segments
+    segments = frames_to_segments(frame_times, probs)
+    print(f'  Detected {len(segments)} whistle event(s)')
+
+    # Step 4: slice and save each detected segment as its own WAV clip
+    saved = save_whistle_clips(y, sr, segments, OUTPUT_DIR, wav_stem)
+    all_saved.extend(saved)
+
+    # Collect detection metadata for the summary CSV
+    for s, e in segments:
+        all_det_rows.append({
+            'wav'     : os.path.basename(wav_path),
+            'start'   : round(s, 3),
+            'end'     : round(e, 3),
+            'duration': round(e - s, 3),
+        })
+
+# Save one combined CSV listing every detection across all recordings
+det_df   = pd.DataFrame(all_det_rows)
+det_path = os.path.join(OUTPUT_DIR, 'detections.csv')
+det_df.to_csv(det_path, index=False)
+
+print(f'\n✓ All detections saved → {det_path}')
+print(f'✓ {len(all_saved)} whistle clip(s) saved to {OUTPUT_DIR}/')
+
+############################################################
+
+## Cell 18 — Probability timeline plots
+
+from matplotlib.patches import Patch
+
+# One plot per WAV file showing the full probability timeline.
+# This is your main visual diagnostic for evaluating model performance.
+#
+# Blue shading  = ground-truth whistle windows from your Raven labels
+# Black line    = model's whistle probability at every frame
+# Red dashed    = detection threshold (default 0.5)
+# Coral fill    = frames where the model exceeded the threshold (detections)
+#
+# What to look for:
+#   Good: coral fills line up with blue shading
+#   Missed detection: blue shading with no coral fill → lower THRESHOLD
+#   False positive: coral fill with no blue shading → raise THRESHOLD
+#   Use Cell 21 (threshold sweep) to find the optimal value
+
+for wav_path, labels_df in wav_labels.items():
+    wav_stem = os.path.splitext(os.path.basename(wav_path))[0]
+    if wav_stem not in all_frame_dfs:
+        continue
+
+    frame_df = all_frame_dfs[wav_stem]
+    t = frame_df['time_sec'].values
+    p = frame_df['probability'].values
+
+    fig, ax = plt.subplots(figsize=(14, 3))
+
+    # Shade ground-truth whistle intervals in blue
+    for _, row in labels_df.iterrows():
+        ax.axvspan(row.start, row.end, alpha=0.15, color='steelblue')
+
+    # Plot the model's probability curve
+    ax.plot(t, p, lw=0.6, color='black', alpha=0.8)
+
+    # Draw the threshold line and fill detections in coral
+    ax.axhline(THRESHOLD, color='red', lw=0.8, linestyle='--')
+    ax.fill_between(t, p, THRESHOLD, where=(p >= THRESHOLD),
+                    interpolate=True, alpha=0.4, color='coral')
+
+    ax.set_xlim(t[0], t[-1])
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('P(whistle)')
+    ax.set_title(wav_stem)
+    ax.legend(handles=[
+        Patch(facecolor='steelblue', alpha=0.3, label='Ground truth (Raven labels)'),
+        Patch(facecolor='coral',     alpha=0.5, label='Detected by model'),
+        plt.Line2D([0], [0], color='red', linestyle='--', label=f'Threshold {THRESHOLD}'),
+    ], loc='upper right', fontsize=8)
+    ax.grid(alpha=0.2)
+    plt.tight_layout()
+    plt.show()
+
+############################################################
+
+## Cell 19 — Detection summary table
+
+# Print a summary of all detections across every recording.
+# The per-WAV summary shows count, mean duration, and total whistle time.
+# The full table lists every individual detection with its timestamps.
+# If no detections appear, try lowering THRESHOLD in Cell 3 and re-running
+# Cells 17 and 18 — you don't need to retrain the model to change the threshold.
+if det_df.empty:
+    print('No detections found. Try lowering THRESHOLD in Cell 3.')
+else:
+    print(f'Total detections: {len(det_df)}\n')
+
+    # Per-WAV summary
+    summary = (
+        det_df
+        .groupby('wav')['duration']
+        .agg(count='count', mean_dur='mean', total_dur='sum')
+        .round(3)
+    )
+    display(summary)
+    print()
+
+    # Full detection list
+    display(det_df)
+
+############################################################
+
+#Cell 20 — (Optional) Load a saved model
+
+# Use this cell to reload a previously trained and saved model
+# without having to retrain from scratch.
+#
+# Useful when:
+#   - You want to run inference on new recordings after closing the notebook
+#   - You want to compare outputs at different thresholds without retraining
+#   - Training took a long time and you don't want to repeat it
+#
+# Skip this cell entirely if you just finished training in Cell 13.
+
+# Uncomment the lines below to load a saved model:
+
+# model = WhistleCNN().to(device)
+# model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device))
+# model.eval()
+# print(f'Model loaded from {MODEL_SAVE_PATH}')
+
+############################################################
+
+#Cell 21 — (Optional) Threshold sweep
+
+# Scan across a range of threshold values to find the best one for your data.
+# The default threshold of 0.5 is a reasonable starting point, but the optimal
+# value depends on your specific recordings and how you want to balance
+# catching all whistles (high recall) vs avoiding false positives (high precision).
+#
+# Precision: of all the segments the model flagged as whistles, what fraction
+#            actually overlapped a real whistle? (low = too many false positives)
+# Recall:    of all the real whistles in your labels, what fraction did the
+#            model catch? (low = too many missed whistles)
+# F1:        harmonic mean of precision and recall — best single number to
+#            optimise if you want to balance both
+
+# Choose which WAV to run the sweep on (defaults to the first one)
+#SWEEP_WAV  = list(wav_labels.keys())[0]
+#sweep_stem = os.path.splitext(os.path.basename(SWEEP_WAV))[0]
+
+#y_sw, sr_sw = wav_audio[SWEEP_WAV]
+#ft, pr      = predict_frames(model, y_sw, sr_sw)
+#ldf         = wav_labels[SWEEP_WAV]
+
+#thresholds = np.arange(0.1, 1.0, 0.05)
+#rows = []
+#for thr in thresholds:
+#    segs   = frames_to_segments(ft, pr, threshold=thr)
+#    n_det  = len(segs)
+#    n_true = len(ldf)
+
+    # A detection counts as a true positive (TP) if it overlaps any ground-truth window
+    #tp = sum(
+#        any(s < row.end and e > row.start for _, row in ldf.iterrows())
+#        for s, e in segs
+#    )
+
+ #   prec = tp / n_det  if n_det  > 0 else 0  # precision: TP / all detections
+ #   rec  = tp / n_true if n_true > 0 else 0  # recall: TP / all ground-truth whistles
+ #   f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+
+  #  rows.append({'threshold': round(thr, 2), 'detections': n_det,
+  #                'TP': tp, 'precision': round(prec, 3),
+  #                'recall': round(rec, 3), 'F1': round(f1, 3)})
+
+#sweep_df = pd.DataFrame(rows)
+
+# Left plot: precision, recall, F1 vs threshold
+# Right plot: number of detections vs threshold (red line = ground truth count)
+#fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+#axes[0].plot(sweep_df['threshold'], sweep_df['precision'], label='Precision', marker='o', ms=4)
+#axes[0].plot(sweep_df['threshold'], sweep_df['recall'],    label='Recall',    marker='s', ms=4)
+#axes[0].plot(sweep_df['threshold'], sweep_df['F1'],        label='F1',        marker='^', ms=4)
+#axes[0].axvline(THRESHOLD, color='red', linestyle='--', label=f'Current ({THRESHOLD})')
+#axes[0].set_xlabel('Threshold');  axes[0].set_ylabel('Score')
+#axes[0].set_title(f'Precision / Recall / F1  —  {sweep_stem}')
+#axes[0].legend();  axes[0].grid(alpha=0.3)
+
+#axes[1].bar(sweep_df['threshold'], sweep_df['detections'], width=0.04, color='steelblue', alpha=0.7)
+#axes[1].axhline(len(ldf), color='red', linestyle='--', label=f'Ground truth ({len(ldf)})')
+#axes[1].axvline(THRESHOLD, color='orange', linestyle='--', label=f'Current ({THRESHOLD})')
+#axes[1].set_xlabel('Threshold');  axes[1].set_ylabel('# Detections')
+#axes[1].set_title('Detections vs threshold')
+#axes[1].legend();  axes[1].grid(alpha=0.3)
+
+#plt.tight_layout()
+#plt.show()
+
+# Table of all threshold values with their metrics
+# Look for the row with the highest F1 score — that's your optimal threshold.
+# Update THRESHOLD in Cell 3 to that value, then re-run Cells 17 and 18.
+#display(sweep_df)
