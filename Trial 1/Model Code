@@ -731,6 +731,10 @@ print(WhistleCNN())
 #Recall — of all the real whistles in your data, what fraction did the model catch? Low recall = too many missed whistles.
 #F1 — the single most useful number. It's the balance between precision and recall. Anything above 0.75 is decent for this type of problem. Above 0.85 is good.
 
+#If whistle recall is low (e.g. 0.40–0.60), the model is missing a lot of real whistles → lower your THRESHOLD in Cell 3
+#If whistle precision is low (e.g. below 0.60), the model has too many false detections → raise your THRESHOLD
+#If both are low, the model needs more training data or more epochs
+
 def train_model(patches, targets, epochs=EPOCHS, device=device):
     """
     Full training loop:
