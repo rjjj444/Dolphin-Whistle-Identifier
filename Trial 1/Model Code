@@ -727,6 +727,10 @@ print(WhistleCNN())
 
 ## Cell 13 — Train the model
 
+#Precision — of everything the model called a whistle, what fraction actually was one? Low precision = too many false positives (calling noise a whistle).
+#Recall — of all the real whistles in your data, what fraction did the model catch? Low recall = too many missed whistles.
+#F1 — the single most useful number. It's the balance between precision and recall. Anything above 0.75 is decent for this type of problem. Above 0.85 is good.
+
 def train_model(patches, targets, epochs=EPOCHS, device=device):
     """
     Full training loop:
